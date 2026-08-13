@@ -3,148 +3,95 @@
 # requires-python = ">=3.11"
 # dependencies = ["httpx>=0.27"]
 # ///
-"""One-shot reconnaissance of the Larimer County inspections portal.
+"""Characterise the 403 the Larimer inspections portal returns to CI runners.
 
-This session's network policy blocks inspections.myhealthdepartment.com, so this
-script runs in CI (which has open egress) and dumps everything needed to write
-the real scraper into the job log. It is throwaway: delete once scraper.py works.
+Round 1 got 403 on every path including /robots.txt. That is either (a) the
+portal blocking datacenter IP ranges, or (b) it sniffing for a full browser
+header set. Those have very different consequences for this project, so this
+round tells them apart before any scraper gets written.
 """
 
 from __future__ import annotations
 
-import json
-import re
 import sys
-from urllib.parse import urljoin, urlparse
 
 import httpx
 
-BASE = "https://inspections.myhealthdepartment.com"
-LANDING = f"{BASE}/larimer-county-health"
+PORTAL = "https://inspections.myhealthdepartment.com/larimer-county-health"
 UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 
-# Patterns worth knowing about when reverse-engineering the portal's data layer.
-INTERESTING = [
-    (r"task=([A-Za-z0-9_]+)", "task param"),
-    (r"['\"](/[A-Za-z0-9_\-./]*(?:api|search|data|json|ajax)[A-Za-z0-9_\-./]*)['\"]", "path"),
-    (r"(https?://[A-Za-z0-9._\-]+/[A-Za-z0-9_\-./]*(?:api|search|data|json)[^\s'\"]*)", "abs url"),
-    (r"\.(?:get|post)\(\s*['\"]([^'\"]{4,120})['\"]", "http call"),
-    (r"url\s*:\s*['\"]([^'\"]{4,120})['\"]", "url option"),
-    (r"fetch\(\s*['\"]([^'\"]{4,120})['\"]", "fetch"),
-]
-
-client = httpx.Client(
-    headers={"User-Agent": UA, "Accept": "*/*"},
-    follow_redirects=True,
-    timeout=45.0,
-)
+# What a real Chrome tab sends. If this gets through and a bare UA does not,
+# the block is header-based; if both 403, it is the runner's IP.
+FULL_BROWSER = {
+    "User-Agent": UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,"
+              "image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Sec-Ch-Ua": '"Chromium";v="126", "Not:A-Brand";v="24"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"macOS"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+}
 
 
 def rule(title: str) -> None:
     print(f"\n{'=' * 78}\n== {title}\n{'=' * 78}", flush=True)
 
 
-def get(url: str, **kw):
+def attempt(label: str, url: str, headers: dict[str, str] | None) -> None:
+    print(f"\n  [{label}] {url}")
     try:
-        r = client.get(url, **kw)
-        print(f"  GET {url}\n    -> {r.status_code} {r.headers.get('content-type', '?')} "
-              f"{len(r.content)}B final={r.url}")
-        return r
-    except Exception as exc:  # noqa: BLE001 - probe should never hard-fail
-        print(f"  GET {url}\n    -> ERROR {type(exc).__name__}: {exc}")
-        return None
-
-
-def grep(label: str, text: str) -> set[str]:
-    """Print every interesting match in `text`, return the discovered task names."""
-    tasks: set[str] = set()
-    for pattern, kind in INTERESTING:
-        hits = sorted(set(re.findall(pattern, text)))
-        if not hits:
-            continue
-        print(f"    [{kind}] {len(hits)} unique")
-        for hit in hits[:40]:
-            print(f"      {hit}")
-        if len(hits) > 40:
-            print(f"      ... +{len(hits) - 40} more")
-        if kind == "task param":
-            tasks.update(hits)
-    return tasks
+        with httpx.Client(follow_redirects=True, timeout=30.0) as c:
+            r = c.get(url, headers=headers or {})
+    except Exception as exc:  # noqa: BLE001
+        print(f"    ERROR {type(exc).__name__}: {exc}")
+        return
+    print(f"    status={r.status_code} bytes={len(r.content)}")
+    # Response headers name the WAF/CDN doing the blocking (Server, CF-Ray,
+    # X-Amzn-*, Akamai, Incapsula) - that determines whether this is fixable.
+    for k, v in sorted(r.headers.items()):
+        print(f"      {k}: {v[:160]}")
+    body = r.text.strip()
+    if body:
+        print(f"    body[:400]: {body[:400]!r}")
 
 
 def main() -> int:
-    discovered_tasks: set[str] = set()
+    rule("0. Control - is general egress working from this runner?")
+    attempt("control", "https://example.com", FULL_BROWSER)
+    attempt("control-ip", "https://api.ipify.org?format=json", FULL_BROWSER)
 
-    rule("1. Landing page")
-    resp = get(LANDING)
-    if resp is None:
-        return 1
-    html = resp.text
-    print(f"\n  --- first 4000 chars of HTML ---\n{html[:4000]}")
+    rule("1. Portal with a FULL browser header set")
+    attempt("full-headers", PORTAL, FULL_BROWSER)
 
-    rule("2. Inline scripts / embedded config")
-    for i, body in enumerate(re.findall(r"<script\b[^>]*>(.*?)</script>", html, re.S)):
-        body = body.strip()
-        if len(body) < 40:
-            continue
-        print(f"\n  --- inline script #{i} ({len(body)}B) ---")
-        print("  " + body[:2500].replace("\n", "\n  "))
-        discovered_tasks |= grep(f"inline#{i}", body)
+    rule("2. Portal with bare UA only (round 1 behaviour, for comparison)")
+    attempt("bare-ua", PORTAL, {"User-Agent": UA})
 
-    rule("3. Forms, data-* attributes, and iframes")
-    for tag in re.findall(r"<(?:form|iframe)\b[^>]*>", html, re.I):
-        print(f"  {tag[:300]}")
-    data_attrs = sorted(set(re.findall(r"(data-[a-z0-9\-]+)\s*=", html, re.I)))
-    print(f"  data-* attributes present: {data_attrs}")
+    rule("3. Portal with no custom headers at all")
+    attempt("no-headers", PORTAL, None)
 
-    rule("4. Same-origin JavaScript bundles")
-    srcs = re.findall(r"<script\b[^>]*\bsrc=['\"]([^'\"]+)['\"]", html, re.I)
-    print(f"  {len(srcs)} script tags with src:")
-    for s in srcs:
-        print(f"    {s}")
-    for src in srcs:
-        full = urljoin(str(resp.url), src)
-        if urlparse(full).netloc != urlparse(BASE).netloc:
-            continue  # third-party (analytics, CDN jQuery) - not our data layer
-        js = get(full)
-        if js is None or js.status_code != 200:
-            continue
-        print(f"    --- grepping {full} ---")
-        discovered_tasks |= grep(full, js.text)
+    rule("4. Portal root and robots (is the whole host blocked, or just the path?)")
+    attempt("host-root", "https://inspections.myhealthdepartment.com/", FULL_BROWSER)
+    attempt("robots", "https://inspections.myhealthdepartment.com/robots.txt", FULL_BROWSER)
+    attempt("vendor-www", "https://www.myhealthdepartment.com/", FULL_BROWSER)
 
-    rule("5. Candidate data endpoints")
-    print(f"  tasks discovered so far: {sorted(discovered_tasks)}")
-    # `task=` is this vendor's dispatch convention (seen in their /print/ URLs).
-    guesses = sorted(discovered_tasks) or [
-        "getSearchResults", "getResults", "search", "getFacilities",
-        "getInspections", "getEstablishments", "getList",
-    ]
-    for task in guesses:
-        for path in ("/larimer-county-health/", "/larimer-county-health/search/"):
-            r = get(
-                f"{BASE}{path}",
-                params={"task": task, "path": "larimer-county-health"},
-                headers={"X-Requested-With": "XMLHttpRequest",
-                         "Accept": "application/json, text/plain, */*"},
-            )
-            if r is None or r.status_code != 200:
-                continue
-            body = r.text.strip()
-            looks_json = body[:1] in "[{" or "json" in r.headers.get("content-type", "")
-            print(f"      JSON-ish={looks_json}  first 600 chars:")
-            print("      " + body[:600].replace("\n", "\n      "))
-
-    rule("6. Robots / sitemap / well-known data files")
-    for path in ("/robots.txt", "/sitemap.xml", "/larimer-county-health/sitemap.xml"):
-        r = get(BASE + path)
-        if r is not None and r.status_code == 200:
-            print("      " + r.text[:1200].replace("\n", "\n      "))
+    rule("5. Larimer County's own site - is there an alternate route to the data?")
+    attempt(
+        "larimer-food-safety",
+        "https://www.larimer.gov/health/environmental-health/food-safety-program/"
+        "restaurant-grocery-store-inspections",
+        FULL_BROWSER,
+    )
 
     rule("DONE")
-    print(json.dumps({"tasks": sorted(discovered_tasks), "scripts": srcs}, indent=2))
     return 0
 
 
