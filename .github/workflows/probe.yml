@@ -1,0 +1,23 @@
+name: probe
+
+# Throwaway reconnaissance workflow: the dev environment cannot reach the
+# inspections portal, so we learn its structure from a runner instead.
+# Delete this file once scripts/scrape.py is working.
+
+on:
+  push:
+    paths:
+      - "scripts/probe.py"
+      - ".github/workflows/probe.yml"
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Probe the portal
+        run: uv run scripts/probe.py
